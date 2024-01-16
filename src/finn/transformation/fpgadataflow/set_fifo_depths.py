@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import math
+import os
 import numpy as np
 import warnings
 from onnx import TensorProto, helper
@@ -39,6 +40,7 @@ from qonnx.transformation.general import (
     GiveUniqueNodeNames,
     SortGraph,
 )
+from tqdm import tqdm
 
 from finn.analysis.fpgadataflow.dataflow_performance import dataflow_performance
 from finn.transformation.fpgadataflow.annotate_cycles import AnnotateCycles
@@ -260,10 +262,13 @@ class InsertAndSetFIFODepths(Transformation):
         # change external to decoupled and warn user
         # this way we are sure we have exactly one input/output
         modified_fc_nodes = []
+        perf = model.analysis(dataflow_performance)
+        latency = perf["critical_path_cycles"]
         for node in model.graph.node:
             # verify assumptions
             assert is_fpgadataflow_node(node), "Found non-fpgadataflow node: " + str(node)
             assert node.op_type != "StreamingFIFO", "Found existing StreamingFIFO node"
+            node_type = node.op_type
             node = getCustomOp(node)
             ifd = node.get_nodeattr("inFIFODepths")
             ofd = node.get_nodeattr("outFIFODepths")
@@ -273,10 +278,16 @@ class InsertAndSetFIFODepths(Transformation):
             else:
                 # set each FIFO to its tensor size
                 # (except stream width hence the :-1)
-                for i in range(len(ifd)):
-                    ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1])
-                for o in range(len(ofd)):
-                    ofd[o] = np.prod(node.get_folded_output_shape(o)[:-1])
+                if node_type == "DuplicateStreams_Batch":
+                    for i in range(len(ifd)):
+                        ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1])
+                    for o in range(len(ofd)):
+                        ofd[o] = np.prod(node.get_folded_output_shape(o)[:-1]) * 2
+                else:
+                    for i in range(len(ifd)):
+                        ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1])
+                    for o in range(len(ofd)):
+                        ofd[o] = np.prod(node.get_folded_output_shape(o)[:-1])
             node.set_nodeattr("inFIFODepths", ifd)
             node.set_nodeattr("outFIFODepths", ofd)
 
@@ -339,7 +350,24 @@ class InsertAndSetFIFODepths(Transformation):
             ncycles = int(latency + max_cycles)
 
             # prepare pyverilator model
-            sim = pyverilate_stitched_ip(model)
+            sim = pyverilate_stitched_ip(model, extra_verilator_args=["-CFLAGS", "-O3", "--threads", "4"])
+
+            inp_tvalid, inp_tready, inp_tqdm, inp_size, inp_cnt = [], [], [], [], []
+            for i in range(len(model.graph.input)):
+                first_node = getCustomOp(model.find_consumer(model.graph.input[i].name))
+                inp_size.append(first_node.get_number_output_values())
+                inp_cnt.append(0)
+                inp_tvalid.append(f"s_axis_{i}_tvalid")
+                inp_tready.append(f"s_axis_{i}_tready")
+                inp_tqdm.append(tqdm(total=inp_size[i], desc=f"inp_{i}", miniters=1))
+            outp_tvalid, outp_tready, outp_tqdm, outp_size, outp_cnt = [], [], [], [], []
+            for i in range(len(model.graph.output)):
+                last_node = getCustomOp(model.find_producer(model.graph.output[i].name))
+                outp_size.append(last_node.get_number_output_values())
+                outp_cnt.append(0)
+                outp_tvalid.append(f"m_axis_{i}_tvalid")
+                outp_tready.append(f"m_axis_{i}_tready")
+                outp_tqdm.append(tqdm(total=outp_size[i], desc=f"out_{i}", miniters=1))
 
             reset_rtlsim(sim)
             toggle_clk(sim)
@@ -351,21 +379,38 @@ class InsertAndSetFIFODepths(Transformation):
             set_signal(sim, "tdata", 0)
 
             output_detected = False
-            while ncycles > 0:
-                toggle_clk(sim)
-                # set/unset valids
-                if ncycles % ncycles_per_input == 0:
-                    set_signal(sim, "tvalid", 1)
-                else:
-                    set_signal(sim, "tvalid", 0)
+            with tqdm(total=ncycles, desc="cycles", miniters=1) as t:
+                while ncycles > 0:
+                    toggle_clk(sim)
+                    # set/unset valids
+                    if ncycles % ncycles_per_input == 0:
+                        for i in range(len(inp_tvalid)):
+                            if inp_cnt[i] < inp_size[i] or output_detected:
+                                sim.io[inp_tvalid[i]] = 1
+                                if sim.io[inp_tready[i]] == 1 and not output_detected:
+                                    inp_cnt[i] += 1
+                                    inp_tqdm[i].update(1)
+                    else:
+                        for v in inp_tvalid:
+                            sim.io[v] = 0
 
-                # since latency estimation is very pessimistic, detect first output
-                # and fast-forward the sim
-                if get_signal(sim, "tvalid") != 0 and not output_detected:
-                    ncycles = max_cycles
-                    output_detected = True
-                else:
+                    for o in range(len(outp_tvalid)):
+                        if sim.io[outp_tvalid[o]] == 1 and not output_detected:
+                            outp_tqdm[o].update(1)
+                            outp_cnt[o] += 1
+                    t.update(1)
                     ncycles = ncycles - 1
+                    # since latency estimation is very pessimistic, detect first output
+                    # and fast-forward the sim
+                    if all(cnt >= size for cnt, size in zip(outp_cnt, outp_size)) and not output_detected:
+                        print(f"Update from {ncycles} to {max_cycles}")
+                        t.update(ncycles-max_cycles)
+                        ncycles = max_cycles
+                        output_detected = True
+            for i_t in inp_tqdm:
+                i_t.close()
+            for o_t in outp_tqdm:
+                o_t.close()
 
             if not output_detected:
                 warnings.warn("No output detected, calculated FIFO depths may not be correct")

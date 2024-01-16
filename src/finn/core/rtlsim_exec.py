@@ -27,8 +27,9 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import os
-from pyverilator.util.axi_utils import reset_rtlsim, rtlsim_multi_io
+from pyverilator.util.axi_utils import _read_signal, reset_rtlsim, rtlsim_multi_io
 from qonnx.custom_op.registry import getCustomOp
+import tqdm
 
 from finn.util.basic import pyverilate_get_liveness_threshold_cycles
 from finn.util.data_packing import npy_to_rtlsim_input, rtlsim_output_to_npy
@@ -72,6 +73,7 @@ def rtlsim_exec(model, execution_context, pre_hook=None, post_hook=None):
     io_dict = {"inputs": {}, "outputs": {}}
     if_dict = eval(model.get_metadata_prop("vivado_stitch_ifnames"))
     # go over and prepare inputs
+    num_in_values = 0
     for i, i_vi in enumerate(model.graph.input):
         i_name = i_vi.name
         i_tensor = execution_context[i_name]
@@ -100,6 +102,7 @@ def rtlsim_exec(model, execution_context, pre_hook=None, post_hook=None):
         # add to io_dict
         if_name = if_dict["s_axis"][i][0]
         io_dict["inputs"][if_name] = packed_input
+        num_in_values += len(packed_input)
     # go over outputs to determine how many values will be produced
     num_out_values = 0
     o_tensor_info = []
@@ -132,18 +135,34 @@ def rtlsim_exec(model, execution_context, pre_hook=None, post_hook=None):
     else:
         sim = PyVerilator(rtlsim_so, auto_eval=False)
 
+    def hook_preclk(sim):
+        sim.tqdm_cyc.update(1)
+        for inp in io_dict["inputs"]:
+            if _read_signal(sim, inp + "_TREADY") == 1 and _read_signal(sim, inp + "_TVALID") == 1:
+                sim.tqdm_in.update(1)
+        for outp in io_dict["outputs"]:
+            if _read_signal(sim, outp + "_TREADY") == 1 and _read_signal(sim, outp + "_TVALID") == 1:
+                sim.tqdm_out.update(1)
+
     # reset and call rtlsim, including any pre/post hooks
     reset_rtlsim(sim)
     if pre_hook is not None:
         pre_hook(sim)
-    n_cycles = rtlsim_multi_io(
-        sim,
-        io_dict,
-        num_out_values,
-        trace_file=trace_file,
-        sname="_",
-        liveness_threshold=pyverilate_get_liveness_threshold_cycles(),
-    )
+    with tqdm.tqdm(desc="cycles") as t_cyc:
+        with tqdm.tqdm(total=num_in_values, desc="num_in") as t_in:
+            with tqdm.tqdm(total=num_out_values, desc="num_out") as t_out:
+                sim.tqdm_cyc = t_cyc
+                sim.tqdm_in = t_in
+                sim.tqdm_out = t_out
+                n_cycles = rtlsim_multi_io(
+                    sim,
+                    io_dict,
+                    num_out_values,
+                    trace_file=trace_file,
+                    sname="_",
+                    liveness_threshold=pyverilate_get_liveness_threshold_cycles(),
+                    hook_preclk=hook_preclk,
+                )
     if post_hook is not None:
         post_hook(sim)
 

@@ -584,6 +584,8 @@ class MoveScalarLinearPastInvariants(Transformation):
                     continue
 
                 if prod0.op_type in ["Mul", "Add", "Div"]:
+                    if model.is_fork_node(prod0):
+                        continue
                     # check if second input of producer is an initializer
                     init0 = model.get_initializer(prod0.input[1])
                     # if either initializer is None, skip

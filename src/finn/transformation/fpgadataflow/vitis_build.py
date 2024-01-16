@@ -381,7 +381,7 @@ class VitisBuild(Transformation):
     def apply(self, model):
         _check_vitis_envvars()
         # prepare at global level, then break up into kernels
-        prep_transforms = [InsertIODMA(512), InsertDWC()]
+        prep_transforms = [InsertIODMA(128), InsertDWC()]
         for trn in prep_transforms:
             model = model.transform(trn)
             model = model.transform(GiveUniqueNodeNames())

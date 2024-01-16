@@ -189,7 +189,8 @@ class FactorOutMulSignMagnitude(Transformation):
             if n.op_type == "Mul":
                 mul_weight_name = n.input[1]
                 A = model.get_initializer(mul_weight_name)
-                assert A is not None, "Initializer for mul weights is not set."
+                if A is None:
+                    continue
                 is_scalar = np.prod(A.shape) == 1
                 actual_ndims = len(tuple(filter(lambda x: x > 1, A.shape)))
                 is_1d = actual_ndims == 1

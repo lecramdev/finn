@@ -63,6 +63,8 @@ pip install --user -e ${FINN_ROOT}/deps/finn-experimental
 pip install --user -e ${FINN_ROOT}/deps/brevitas
 # pyverilator
 pip install --user -e ${FINN_ROOT}/deps/pyverilator
+# ultralytics
+pip install --user -e ${FINN_ROOT}/deps/ultralytics
 
 if [ -f "${FINN_ROOT}/setup.py" ];then
   # run pip install for finn

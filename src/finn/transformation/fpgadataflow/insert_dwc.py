@@ -10,6 +10,8 @@ from finn.util.fpgadataflow import is_fpgadataflow_node
 def _is_dwc_node(node):
     if node.op_type == "StreamingDataWidthConverter_Batch":
         return True
+    elif node.op_type == "StreamingDataWidthConverter_rtl":
+        return True
     else:
         return False
 
@@ -72,16 +74,16 @@ class InsertDWC(Transformation):
                                     in_idx = idx
                             assert in_idx is not None, "Malformed model"
                             n1_in_shape = n1.get_folded_input_shape(in_idx)
+                            dwc_out_width = n1.get_instream_width(in_idx)
                         else:
-                            # use default folded input shape
+                            # use default folded input shape and width
                             n1_in_shape = n1.get_folded_input_shape()
+                            dwc_out_width = n1.get_instream_width()
 
                         if n0_out_shape[-1] != n1_in_shape[-1]:
                             graph_modified = True
                             # determine dwc inwidth
                             dwc_in_width = n0.get_outstream_width()
-                            # determine dwc outwidth
-                            dwc_out_width = n1.get_instream_width()
                             if self.use_rtl_variant:
                                 # check if rtl variant can be used
                                 iwidth_d = dwc_in_width % dwc_out_width == 0

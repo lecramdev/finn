@@ -42,6 +42,7 @@ def hls_synth_res_estimation(model):
     Returns {node name : resources_dict}."""
 
     res_dict = {}
+    res_dict["total"] = dict()
     for node in model.graph.node:
         if is_fpgadataflow_node(node) is True:
             # init values to zero
@@ -70,6 +71,10 @@ def hls_synth_res_estimation(model):
                     for item in root.findall("AreaEstimates/Resources"):
                         for child in item:
                             res_dict[node.name][child.tag] = child.text
+                            if child.tag in res_dict["total"]:
+                                res_dict["total"][child.tag] += int(child.text) if child.text.isdecimal() else 0
+                            else:
+                                res_dict["total"][child.tag] = int(child.text) if child.text.isdecimal() else 0
                 else:
                     warnings.warn(
                         """Could not find report files, values will be set to zero

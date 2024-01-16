@@ -672,7 +672,7 @@ def step_measure_rtlsim_performance(model: ModelWrapper, cfg: DataflowBuildConfi
                     "rtlsim_trace",
                     "%s/rtlsim_perf_batch_%d.vcd" % (report_dir, rtlsim_bs),
                 )
-            rtlsim_model.set_metadata_prop("extra_verilator_args", str(["-CFLAGS", "-O3"]))
+            rtlsim_model.set_metadata_prop("extra_verilator_args", str(["-CFLAGS", "-O3", "--threads", "8"]))
             # run with single input to get latency
             rtlsim_latency_dict = throughput_test_rtlsim(rtlsim_model, 1)
             # run with batch to get stable-state throughput
