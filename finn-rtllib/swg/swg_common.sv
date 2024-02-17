@@ -81,6 +81,7 @@ import swg::*; #(
             STATE_LOOP_KH   : addr_incr = HEAD_INCR_KH;
             STATE_LOOP_W    : addr_incr = HEAD_INCR_W;
             STATE_LOOP_H    : addr_incr = HEAD_INCR_H;
+            default         : addr_incr = 0;
         endcase
     end
 

@@ -350,7 +350,7 @@ class InsertAndSetFIFODepths(Transformation):
             ncycles = int(latency + max_cycles)
 
             # prepare pyverilator model
-            sim = pyverilate_stitched_ip(model, extra_verilator_args=["-CFLAGS", "-O3", "--threads", "4"])
+            sim = pyverilate_stitched_ip(model, extra_verilator_args=["-CFLAGS", "-O3", "--threads", "6"])
 
             inp_tvalid, inp_tready, inp_tqdm, inp_size, inp_cnt = [], [], [], [], []
             for i in range(len(model.graph.input)):

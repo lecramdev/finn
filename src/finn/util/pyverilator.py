@@ -300,6 +300,7 @@ def pyverilate_stitched_ip(
     verilator_args.append("-DOBSOLETE")
     verilator_args.append("-DONESPIN")
     verilator_args.append("--bbox-unsup")
+    verilator_args.append("--no-timing")
     vivado_path = os.environ["VIVADO_PATH"]
     # additional SystemVerilog modules to make XPMs work with Verilator
     xpm_memory = f"{vivado_path}/data/ip/xpm/xpm_memory/hdl/xpm_memory.sv"
