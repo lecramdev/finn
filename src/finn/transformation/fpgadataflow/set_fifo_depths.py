@@ -278,11 +278,11 @@ class InsertAndSetFIFODepths(Transformation):
             else:
                 # set each FIFO to its tensor size
                 # (except stream width hence the :-1)
-                if node_type == "DuplicateStreams_Batch":
+                if node_type == "StreamingConcat":
                     for i in range(len(ifd)):
-                        ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1])
+                        ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1]) * 8
                     for o in range(len(ofd)):
-                        ofd[o] = np.prod(node.get_folded_output_shape(o)[:-1]) * 2
+                        ofd[o] = np.prod(node.get_folded_output_shape(o)[:-1])
                 else:
                     for i in range(len(ifd)):
                         ifd[i] = np.prod(node.get_folded_input_shape(i)[:-1])
@@ -333,30 +333,23 @@ class InsertAndSetFIFODepths(Transformation):
             # do rtlsim in Python for FIFO sizing
             # calculate input frequency (number of cycles for each input word)
             first_node = getCustomOp(model.graph.node[0])
-            ncycles_per_input = max(
-                1,
-                int(
-                    math.ceil(
-                        perf["max_cycles"]
-                        / (
-                            np.prod(first_node.get_folded_input_shape())
-                            / first_node.get_folded_input_shape()[-1]
-                        )
-                    )
-                ),
-            )
 
             # set sufficiently large threshold for 1 image to  fully execute and exit
             ncycles = int(latency + max_cycles)
 
             # prepare pyverilator model
-            sim = pyverilate_stitched_ip(model, extra_verilator_args=["-CFLAGS", "-O3", "--threads", "6"])
+            # os.environ["RTLSIM_TRACE_DEPTH"] = "3"
+            sim = pyverilate_stitched_ip(model, extra_verilator_args=["-CFLAGS", "-O3", "--threads", "6", "-CFLAGS", "-DVL_VALUE_STRING_MAX_WORDS=256"])
+            # sim.start_vcd_trace("set_fifo_trace.vcd")
 
-            inp_tvalid, inp_tready, inp_tqdm, inp_size, inp_cnt = [], [], [], [], []
+            latency_tqdm =  tqdm(desc="latency", miniters=1)
+            inp_tvalid, inp_tready, inp_tqdm, inp_size, inp_per_cycle, inp_cnt, inp_n = [], [], [], [], [], [], []
             for i in range(len(model.graph.input)):
                 first_node = getCustomOp(model.find_consumer(model.graph.input[i].name))
                 inp_size.append(first_node.get_number_output_values())
+                inp_per_cycle.append(np.prod(first_node.get_folded_input_shape()[:-1]) / perf["max_cycles"])
                 inp_cnt.append(0)
+                inp_n.append(0)
                 inp_tvalid.append(f"s_axis_{i}_tvalid")
                 inp_tready.append(f"s_axis_{i}_tready")
                 inp_tqdm.append(tqdm(total=inp_size[i], desc=f"inp_{i}", miniters=1))
@@ -368,6 +361,7 @@ class InsertAndSetFIFODepths(Transformation):
                 outp_tvalid.append(f"m_axis_{i}_tvalid")
                 outp_tready.append(f"m_axis_{i}_tready")
                 outp_tqdm.append(tqdm(total=outp_size[i], desc=f"out_{i}", miniters=1))
+            stall_tqdm =  tqdm(desc="stall", miniters=1)
 
             reset_rtlsim(sim)
             toggle_clk(sim)
@@ -378,42 +372,55 @@ class InsertAndSetFIFODepths(Transformation):
             set_signal(sim, "tready", 1)
             set_signal(sim, "tdata", 0)
 
-            output_detected = False
-            with tqdm(total=ncycles, desc="cycles", miniters=1) as t:
-                while ncycles > 0:
-                    toggle_clk(sim)
-                    # set/unset valids
-                    if ncycles % ncycles_per_input == 0:
-                        for i in range(len(inp_tvalid)):
-                            if inp_cnt[i] < inp_size[i] or output_detected:
-                                sim.io[inp_tvalid[i]] = 1
-                                if sim.io[inp_tready[i]] == 1 and not output_detected:
-                                    inp_cnt[i] += 1
-                                    inp_tqdm[i].update(1)
+            latency = 0
+            while latency < ncycles:
+                toggle_clk(sim)
+                for i in range(len(inp_tvalid)):
+                    inp_n[i] += inp_per_cycle[i]
+                    if (inp_cnt[i] < inp_size[i] and inp_cnt[i] <= inp_n[i]):
+                        sim.io[inp_tvalid[i]] = 1
+                        if sim.io[inp_tready[i]] == 1:
+                            inp_cnt[i] += 1
+                            inp_tqdm[i].update(1)
+                        else:
+                            stall_tqdm.update(1)
                     else:
-                        for v in inp_tvalid:
-                            sim.io[v] = 0
+                        sim.io[inp_tvalid[i]] = 0
 
-                    for o in range(len(outp_tvalid)):
-                        if sim.io[outp_tvalid[o]] == 1 and not output_detected:
-                            outp_tqdm[o].update(1)
-                            outp_cnt[o] += 1
-                    t.update(1)
-                    ncycles = ncycles - 1
-                    # since latency estimation is very pessimistic, detect first output
-                    # and fast-forward the sim
-                    if all(cnt >= size for cnt, size in zip(outp_cnt, outp_size)) and not output_detected:
-                        print(f"Update from {ncycles} to {max_cycles}")
-                        t.update(ncycles-max_cycles)
-                        ncycles = max_cycles
-                        output_detected = True
+                for o in range(len(outp_tvalid)):
+                    if sim.io[outp_tvalid[o]] == 1:
+                        outp_tqdm[o].update(1)
+                        outp_cnt[o] += 1
+                latency_tqdm.update(1)
+                latency += 1
+                # break if one full frame is processed
+                if all(cnt >= size for cnt, size in zip(outp_cnt, outp_size)):
+                    break
+            else:
+                warnings.warn("No output detected, calculated FIFO depths may not be correct")
+            latency_tqdm.close()
             for i_t in inp_tqdm:
                 i_t.close()
             for o_t in outp_tqdm:
                 o_t.close()
 
-            if not output_detected:
-                warnings.warn("No output detected, calculated FIFO depths may not be correct")
+            for c in tqdm(range(latency), desc="cycles"):
+                toggle_clk(sim)
+                for i in range(len(inp_tvalid)):
+                    inp_n[i] += inp_per_cycle[i]
+                    if (inp_cnt[i] <= inp_n[i]):
+                        sim.io[inp_tvalid[i]] = 1
+                        if sim.io[inp_tready[i]] == 1:
+                            inp_cnt[i] += 1
+                        else:
+                            stall_tqdm.update(1)
+                    else:
+                        sim.io[inp_tvalid[i]] = 0
+            
+            stall_tqdm.close()
+            
+            # sim.flush_vcd_trace()
+            # sim.stop_vcd_trace()
         else:
             # do rtlsim in C++ for FIFO sizing
             # determine # inputs for FIFO sizing according to topology type
