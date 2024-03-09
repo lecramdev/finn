@@ -31,7 +31,7 @@ import os
 import textwrap
 import warnings
 from math import ceil, log2
-from qonnx.core.datatype import DataType
+from qonnx.core.datatype import DataType, IntType
 from qonnx.util.basic import (
     interleave_matrix_outer_dim_from_partitions,
     roundup_to_integer_multiple,
@@ -345,38 +345,97 @@ class Thresholding_Batch(HLSCustomOp):
         * weight_file_name : filename for the weight file to be generated
 
         """
+        self.is_linear = False
         threshold_tensor = self.get_hls_compatible_threshold_tensor(weights)
         tdt = self.get_weight_datatype()
         assert np.vectorize(tdt.allowed)(
             threshold_tensor
         ).all(), "Thresholds can't be expressed with type %s" % str(tdt)
         if weight_file_mode == "hls_header":
-            # save thresholds in thresh.h
-            thresholds_hls_code = numpy_to_hls_code(
-                threshold_tensor, tdt, "thresholds", False, True
-            )
-            # write thresholds into thresh.h
-            f_thresh = open(weight_file_name, "w")
-            tdt_hls = tdt.get_hls_datatype_str()
-            # use binary to export bipolar activations
-            export_odt = self.get_output_datatype()
-            if self.get_output_datatype() == DataType["BIPOLAR"]:
-                export_odt = DataType["BINARY"]
-            odt_hls = export_odt.get_hls_datatype_str()
-            f_thresh.write(
-                "static ThresholdsActivation<{},{},{},{},{},{},{}> threshs \
-                = ".format(
-                    self.calc_tmem(),
-                    self.get_nodeattr("PE"),
-                    threshold_tensor.shape[-1],
-                    tdt_hls,
-                    odt_hls,
-                    self.get_nodeattr("ActVal"),
-                    "comp::less_equal<%s, %s>" % (tdt_hls, tdt_hls),
+            coeffs = np.zeros(list(threshold_tensor.shape[:-1]) + [2])
+            max_thresh = np.zeros(threshold_tensor.shape[:-1])
+            is_linear = []
+            for pe in range(threshold_tensor.shape[1]):
+                for tmem in range(threshold_tensor.shape[2]):
+                    x = threshold_tensor[0,pe,tmem,:]
+                    while x[-1] == x[-2] and x[-2] == x[-3]:
+                            x = x[0:-1]
+                    if x[-1] == x[-2]:
+                        x = x[0:-2]
+                    y = list(range(1, x.shape[0]+1))
+                    coeff, res, _, _, _ = np.polyfit(x, y, 1, full=True)
+                    coeffs[0,pe,tmem,:] = coeff
+                    max_thresh[0,pe,tmem] = x.max()
+                    is_linear.append(res[0]/x.max() < 1e-3)
+                    if not is_linear[-1]:
+                        print(f"{res[0]/x.max() < 1e-3} {res[0]/x.max():.3g}")
+                        print(x)
+            if all(is_linear) and self.get_output_datatype() != DataType["BIPOLAR"]:
+                self.is_linear = True
+                # save thresholds in thresh.h
+                coeffs[:,:,:,1] += self.get_nodeattr("ActVal")
+                max_c = np.abs(coeffs).max()
+                shift = int(np.floor(-log2(max_c))) + 15
+                coeffs = coeffs * 2**shift
+                coeffs_hls_code = numpy_to_hls_code(
+                    coeffs, DataType["INT16"], "coeffs", False, True
                 )
-            )
-            f_thresh.write(thresholds_hls_code)
-            f_thresh.close()
+                export_odt = self.get_output_datatype()
+                # write thresholds into thresh.h
+                f_thresh = open(weight_file_name, "w")
+                f_thresh.write(
+                    ("struct MulBias {{\n"
+                    "    {otype} operator()(const std::pair<ap_int<16>, ap_int<16>> &param, const {itype} &in) {{\n"
+                    "        auto mb = param.first * in + param.second;\n"
+                    "        ap_int<16+{iwidth}+1-{shift}> res = mb >> {shift};\n"
+                    "        if(res < {omin})\n"
+                    "            return {omin};\n"
+                    "        if(res > {omax})\n"
+                    "            return {omax};\n"
+                    "        return res;\n"
+                    "    }}\n"
+                    "}};\n"
+                    "static ChannelWiseOperation<{tmem}, {pe}, {itype}, std::pair<ap_int<16>, ap_int<16>>, {otype}, MulBias> threshs = ")
+                    .format(
+                        itype=tdt.get_hls_datatype_str(),
+                        iwidth=tdt.bitwidth(),
+                        otype=export_odt.get_hls_datatype_str(),
+                        omin=export_odt.min(),
+                        omax=export_odt.max(),
+                        shift=shift,
+                        tmem=self.calc_tmem(),
+                        pe=self.get_nodeattr("PE")
+                    )
+                )
+                f_thresh.write(coeffs_hls_code)
+                f_thresh.close()
+            else:
+                # save thresholds in thresh.h
+                thresholds_hls_code = numpy_to_hls_code(
+                    threshold_tensor, tdt, "thresholds", False, True
+                )
+                # write thresholds into thresh.h
+                f_thresh = open(weight_file_name, "w")
+                tdt_hls = tdt.get_hls_datatype_str()
+                # use binary to export bipolar activations
+                export_odt = self.get_output_datatype()
+                if self.get_output_datatype() == DataType["BIPOLAR"]:
+                    export_odt = DataType["BINARY"]
+                odt_hls = export_odt.get_hls_datatype_str()
+                f_thresh.write(
+                    "static ThresholdsActivation<{},{},{},{},{},{},{}> threshs \
+                    = ".format(
+                        self.calc_tmem(),
+                        self.get_nodeattr("PE"),
+                        threshold_tensor.shape[-1],
+                        tdt_hls,
+                        odt_hls,
+                        self.get_nodeattr("ActVal"),
+                        "comp::less_equal<%s, %s>" % (tdt_hls, tdt_hls),
+                    )
+                )
+                f_thresh.write(thresholds_hls_code)
+                f_thresh.close()
         elif "decoupled" in weight_file_mode:
             # streaming thresholds need to be organized differently
             # (1, pe, tmem, n_thres_steps) -> (1, tmem, pe, n_thres_steps)
@@ -755,7 +814,7 @@ class Thresholding_Batch(HLSCustomOp):
         )
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS INTERFACE ap_ctrl_none port=return")
 
-        if self.get_nodeattr("mem_mode") == "const":
+        if self.get_nodeattr("mem_mode") == "const" and not self.is_linear:
             # the threshold tensor is acc_type [PE][TMEM][N_THRES]
             # partition for parallel access along PE and N_THRES
             # dimensions (dims 1 and 3)

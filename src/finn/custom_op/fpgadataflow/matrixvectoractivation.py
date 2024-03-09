@@ -640,13 +640,13 @@ class MatrixVectorActivation(HLSCustomOp):
             adt = DataType[f"INT{acc_bit_width}"]
 
         # if activation, assert that the thresholds can be expressed with adt
-        if thresholds is not None:
-            assert np.vectorize(adt.allowed)(
-                threshold_tensor
-            ).all(), "Thresholds in %s can't be expressed with type %s" % (
-                self.onnx_node.name,
-                str(adt),
-            )
+        # if thresholds is not None:
+        #     assert np.vectorize(adt.allowed)(
+        #         threshold_tensor
+        #     ).all(), "Thresholds in %s can't be expressed with type %s" % (
+        #         self.onnx_node.name,
+        #         str(adt),
+        #     )
 
         # if no activation, output and accumulator datatypes are the same
         if self.get_nodeattr("noActivation"):
@@ -856,6 +856,7 @@ class MatrixVectorActivation(HLSCustomOp):
                 currently no other parameter value is supported!"""
             )
 
+        self.is_linear = False
         # save thresholds in thresh.h
         if len(self.onnx_node.input) > 2:
             thresholds = model.get_initializer(self.onnx_node.input[2])
@@ -873,37 +874,95 @@ class MatrixVectorActivation(HLSCustomOp):
                 # get computed threshold datatype from attribute
                 tdt = DataType[self.get_nodeattr("accDataType")]
 
-                assert np.vectorize(tdt.allowed)(
-                    threshold_tensor
-                ).all(), "Thresholds in %s can't be expressed with type %s" % (
-                    self.onnx_node.name,
-                    str(tdt),
-                )
-                thresholds_hls_code = numpy_to_hls_code(
-                    threshold_tensor, tdt, "thresholds", False, True
-                )
-                # write thresholds into thresh.h
-                f_thresh = open("{}/thresh.h".format(code_gen_dir), "w")
-                tdt_hls = tdt.get_hls_datatype_str()
-                # use binary to export bipolar activations
-                export_odt = self.get_output_datatype()
-                if self.get_output_datatype() == DataType["BIPOLAR"]:
-                    export_odt = DataType["BINARY"]
-                odt_hls = export_odt.get_hls_datatype_str()
-                f_thresh.write(
-                    "static ThresholdsActivation<{},{},{},{},{},{},{}> threshs \
-                    = ".format(
-                        self.calc_tmem(),
-                        self.get_nodeattr("PE"),
-                        threshold_tensor.shape[-1],
-                        tdt_hls,
-                        odt_hls,
-                        self.get_nodeattr("ActVal"),
-                        "comp::less_equal<%s, %s>" % (tdt_hls, tdt_hls),
+                coeffs = np.zeros(list(threshold_tensor.shape[:-1]) + [2])
+                max_thresh = np.zeros(threshold_tensor.shape[:-1])
+                is_linear = []
+                for pe in range(threshold_tensor.shape[1]):
+                    for tmem in range(threshold_tensor.shape[2]):
+                        x = threshold_tensor[0,pe,tmem,:]
+                        while x[-1] == x[-2] and x[-2] == x[-3]:
+                            x = x[0:-1]
+                        if x[-1] == x[-2]:
+                            x = x[0:-2]
+                        y = list(range(1, x.shape[0]+1))
+                        coeff, res, _, _, _ = np.polyfit(x, y, 1, full=True)
+                        coeffs[0,pe,tmem,:] = coeff
+                        max_thresh[0,pe,tmem] = x.max()
+                        is_linear.append((res[0] if len(res)>0 else 0)/x.max() < 1e-3)
+                        if not is_linear[-1]:
+                            print(f"{is_linear[-1]} {(res[0] if len(res)>0 else 0)/x.max():.3g} {x.shape[0]}")
+                            print(x)
+                if all(is_linear) and self.get_output_datatype() != DataType["BIPOLAR"]:
+                    self.is_linear = True
+                    # save thresholds in thresh.h
+                    coeffs[:,:,:,1] += self.get_nodeattr("ActVal")
+                    max_c = np.abs(coeffs).max()
+                    shift = int(np.floor(-np.log2(max_c))) + 15
+                    coeffs = coeffs * 2**shift
+                    coeffs_hls_code = numpy_to_hls_code(
+                        coeffs, DataType["INT16"], "coeffs", False, True
                     )
-                )
-                f_thresh.write(thresholds_hls_code)
-                f_thresh.close()
+                    export_odt = self.get_output_datatype()
+                    # write thresholds into thresh.h
+                    f_thresh = open("{}/thresh.h".format(code_gen_dir), "w")
+                    f_thresh.write(
+                        ("struct MulBias {{\n"
+                        "    {otype} operator()(const std::pair<ap_int<16>, ap_int<16>> &param, const {itype} &in) {{\n"
+                        "        auto mb = param.first * in + param.second;\n"
+                        "        ap_int<16+{iwidth}+1-{shift}> res = mb >> {shift};\n"
+                        "        if(res < {omin})\n"
+                        "            return {omin};\n"
+                        "        if(res > {omax})\n"
+                        "            return {omax};\n"
+                        "        return res;\n"
+                        "    }}\n"
+                        "}};\n"
+                        "static ChannelWiseOperation<{tmem}, {pe}, {itype}, std::pair<ap_int<16>, ap_int<16>>, {otype}, MulBias> threshs = ")
+                        .format(
+                            itype=tdt.get_hls_datatype_str(),
+                            iwidth=tdt.bitwidth(),
+                            otype=export_odt.get_hls_datatype_str(),
+                            omin=export_odt.min(),
+                            omax=export_odt.max(),
+                            shift=shift,
+                            tmem=self.calc_tmem(),
+                            pe=self.get_nodeattr("PE")
+                        )
+                    )
+                    f_thresh.write(coeffs_hls_code)
+                    f_thresh.close()
+                else:
+                    assert np.vectorize(tdt.allowed)(
+                        threshold_tensor
+                    ).all(), "Thresholds in %s can't be expressed with type %s" % (
+                        self.onnx_node.name,
+                        str(tdt),
+                    )
+                    thresholds_hls_code = numpy_to_hls_code(
+                        threshold_tensor, tdt, "thresholds", False, True
+                    )
+                    # write thresholds into thresh.h
+                    f_thresh = open("{}/thresh.h".format(code_gen_dir), "w")
+                    tdt_hls = tdt.get_hls_datatype_str()
+                    # use binary to export bipolar activations
+                    export_odt = self.get_output_datatype()
+                    if self.get_output_datatype() == DataType["BIPOLAR"]:
+                        export_odt = DataType["BINARY"]
+                    odt_hls = export_odt.get_hls_datatype_str()
+                    f_thresh.write(
+                        "static ThresholdsActivation<{},{},{},{},{},{},{}> threshs \
+                        = ".format(
+                            self.calc_tmem(),
+                            self.get_nodeattr("PE"),
+                            threshold_tensor.shape[-1],
+                            tdt_hls,
+                            odt_hls,
+                            self.get_nodeattr("ActVal"),
+                            "comp::less_equal<%s, %s>" % (tdt_hls, tdt_hls),
+                        )
+                    )
+                    f_thresh.write(thresholds_hls_code)
+                    f_thresh.close()
 
     def execute_node(self, context, graph):
         mode = self.get_nodeattr("exec_mode")
@@ -1279,7 +1338,7 @@ class MatrixVectorActivation(HLSCustomOp):
         # the threshold tensor is acc_type [PE][TMEM][N_THRES]
         # partition for parallel access along PE and N_THRES
         # dimensions (dims 1 and 3)
-        if self.calc_tmem() != 0:
+        if self.calc_tmem() != 0 and not self.is_linear:
             # TODO find a better way of checking for no pregenerated thresholds
             self.code_gen_dict["$PRAGMAS$"].append(
                 ("#pragma HLS ARRAY_PARTITION variable=threshs.m_thresholds " "complete dim=1")
