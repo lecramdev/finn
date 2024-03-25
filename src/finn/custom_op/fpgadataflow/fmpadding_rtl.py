@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import math
+import subprocess
 import numpy as np
 import os
 import shutil
@@ -34,6 +35,7 @@ import warnings
 from qonnx.core.datatype import DataType
 from qonnx.util.basic import roundup_to_integer_multiple
 
+from finn.custom_op.fpgadataflow import templates
 from finn.custom_op.fpgadataflow.hlscustomop import HLSCustomOp
 from finn.util.basic import get_rtlsim_trace_depth, make_build_dir
 from finn.util.data_packing import npy_to_rtlsim_input, rtlsim_output_to_npy
@@ -313,10 +315,6 @@ class FMPadding_rtl(HLSCustomOp):
         sv_files = ["fmpadding_axi.sv", "fmpadding.sv", "axi2we.sv"]
         for sv_file in sv_files:
             shutil.copy(rtlsrc + "/" + sv_file, code_gen_dir)
-        # set ipgen_path and ip_path so that HLS-Synth transformation
-        # and stich_ip transformation do not complain
-        self.set_nodeattr("ipgen_path", code_gen_dir)
-        self.set_nodeattr("ip_path", code_gen_dir)
 
     def prepare_rtlsim(self):
         """Creates a Verilator emulation library for the RTL code generated
@@ -350,25 +348,7 @@ class FMPadding_rtl(HLSCustomOp):
 
     def code_generation_ipi(self):
         """Constructs and returns the TCL for node instantiation in Vivado IPI."""
-        code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
-
-        sourcefiles = [
-            "fmpadding_axi.sv",
-            "fmpadding.sv",
-            "axi2we.sv",
-            self.get_nodeattr("gen_top_module") + ".v",
-        ]
-
-        sourcefiles = [os.path.join(code_gen_dir, f) for f in sourcefiles]
-
-        cmd = []
-        for f in sourcefiles:
-            cmd += ["add_files -norecurse %s" % (f)]
-        cmd += [
-            "create_bd_cell -type module -reference %s %s"
-            % (self.get_nodeattr("gen_top_module"), self.onnx_node.name)
-        ]
-        return cmd
+        return super().code_generation_ipi()
 
     def code_generation_ipgen(self, model, fpgapart, clk):
         """Normally: Generates C++ code and tcl script for IP generation.
@@ -377,7 +357,39 @@ class FMPadding_rtl(HLSCustomOp):
 
     def ipgen_singlenode_code(self):
         """Normally: Builds the bash script for IP generation."""
-        pass
+        code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
+        # prepare the IP packaging tcl template
+        template = templates.ip_package_tcl
+        self.code_gen_dict.clear()
+        self.code_gen_dict["$TOPNAME$"] = ["{}".format(self.onnx_node.name)]
+        # note: setting the root dir as absolute can cause path problems
+        # the ipgen script will be invoked from the sources dir so root_dir=. is OK
+        self.code_gen_dict["$VERILOG_DIR$"] = ["."]
+        self.code_gen_dict["$HLS_SNAME$"] = [self.hls_sname()]
+        for key in self.code_gen_dict:
+            # transform list into long string separated by '\n'
+            code_gen_line = "\n".join(self.code_gen_dict[key])
+            template = template.replace(key, code_gen_line)
+        f = open(os.path.join(code_gen_dir, "package_ip.tcl"), "w")
+        f.write(template)
+        f.close()
+        # create a shell script and call Vivado to invoke the IP pkg script
+        make_project_sh = code_gen_dir + "/make_ip.sh"
+        working_dir = os.environ["PWD"]
+        with open(make_project_sh, "w") as f:
+            f.write("#!/bin/bash \n")
+            f.write("cd {}\n".format(code_gen_dir))
+            f.write("vivado -mode batch -source package_ip.tcl\n")
+            f.write("cd {}\n".format(working_dir))
+        bash_command = ["bash", make_project_sh]
+        process_compile = subprocess.Popen(bash_command, stdout=subprocess.PIPE)
+        process_compile.communicate()
+        # set ipgen_path and ip_path to point to the new packaged IP
+        self.set_nodeattr("ipgen_path", code_gen_dir)
+        self.set_nodeattr("ip_path", code_gen_dir)
+        vlnv = "xilinx.com:hls:%s:1.0" % (self.onnx_node.name)
+        self.set_nodeattr("ip_vlnv", vlnv)
+        self.code_gen_dict.clear()
 
     def code_generation_cppsim(self, model):
         """Normally: Generates C++ code for simulation (cppsim)."""
