@@ -172,7 +172,15 @@ class CapConvolutionFIFODepths(Transformation):
                 if fifo_prod is None:
                     continue
                 if fifo_prod.op_type != "ConvolutionInputGenerator":
-                    continue
+                    # handle DWC between 
+                    if not fifo_prod.op_type.startswith("StreamingDataWidthConverter"):
+                        continue
+                    fifo_prod = model.find_producer(fifo_prod.input[0])
+                    if fifo_prod is None or fifo_prod.op_type != "StreamingFIFO":
+                        continue
+                    fifo_prod = model.find_producer(fifo_prod.input[0])
+                    if fifo_prod is None or fifo_prod.op_type != "ConvolutionInputGenerator":
+                        continue
                 if fifo_cons is None:
                     continue
                 if fifo_cons.op_type != "MatrixVectorActivation":
@@ -377,7 +385,7 @@ class InsertAndSetFIFODepths(Transformation):
                 toggle_clk(sim)
                 for i in range(len(inp_tvalid)):
                     inp_n[i] += inp_per_cycle[i]
-                    if (inp_cnt[i] < inp_size[i] and inp_cnt[i] <= inp_n[i]):
+                    if inp_cnt[i] <= inp_n[i]:
                         sim.io[inp_tvalid[i]] = 1
                         if sim.io[inp_tready[i]] == 1:
                             inp_cnt[i] += 1
@@ -402,21 +410,7 @@ class InsertAndSetFIFODepths(Transformation):
             for i_t in inp_tqdm:
                 i_t.close()
             for o_t in outp_tqdm:
-                o_t.close()
-
-            for c in tqdm(range(latency), desc="cycles"):
-                toggle_clk(sim)
-                for i in range(len(inp_tvalid)):
-                    inp_n[i] += inp_per_cycle[i]
-                    if (inp_cnt[i] <= inp_n[i]):
-                        sim.io[inp_tvalid[i]] = 1
-                        if sim.io[inp_tready[i]] == 1:
-                            inp_cnt[i] += 1
-                        else:
-                            stall_tqdm.update(1)
-                    else:
-                        sim.io[inp_tvalid[i]] = 0
-            
+                o_t.close()            
             stall_tqdm.close()
             
             # sim.flush_vcd_trace()
