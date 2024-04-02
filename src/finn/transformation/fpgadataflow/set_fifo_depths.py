@@ -434,7 +434,7 @@ class InsertAndSetFIFODepths(Transformation):
             maxcount_name = "maxcount_%d" % ind
             if ind == 0:
                 maxcount_name = "maxcount"
-            fifos[node.name] = sim[maxcount_name]
+            fifos[node.name] = int(sim[maxcount_name] * 1)
 
         # Apply depths back into the model;
         # also set in/outFIFODepths to zero for non-FIFO

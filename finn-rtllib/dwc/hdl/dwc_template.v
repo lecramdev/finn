@@ -46,12 +46,12 @@ module $TOP_MODULE_NAME$ #(
 	//- AXI Stream - Input --------------
 	output	in0_V_TREADY,
 	input	in0_V_TVALID,
-	input	[AXI_IBITS-1:0]  in0_V_TDATA,
+	input	[(($IBITS$+7)/8 * 8)-1:0]  in0_V_TDATA,
 
 	//- AXI Stream - Output -------------
 	input	out_V_TREADY,
 	output	out_V_TVALID,
-	output	[AXI_OBITS-1:0]  out_V_TDATA
+	output	[(($OBITS$+7)/8 * 8)-1:0]  out_V_TDATA
 );
 
 	dwc_axi #(
