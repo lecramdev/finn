@@ -32,6 +32,7 @@ import qonnx.core.data_layout as DataLayout
 import warnings
 from onnx import TensorProto, helper
 from qonnx.core.datatype import DataType
+from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.general import SortGraph
@@ -264,6 +265,123 @@ class InferThresholdingLayer(Transformation):
                     numInputVectors=list(thl_in_shape[:-1]),
                     ActVal=actval,
                     name="Thresholding_" + node.name,
+                )
+
+                graph.node.insert(insert_point, new_node)
+                # remove old node
+                graph.node.remove(node)
+                graph_modified = True
+
+        return (model, graph_modified)
+
+
+class InferPOTLinearActivationLayer(Transformation):
+    """Convert MultiThreshold into a POTLinearActivation layer,
+    if the thresholds are linear with a power of two factor."""
+
+    def __init__(self):
+        super().__init__()
+
+    def apply(self, model: ModelWrapper):
+        graph = model.graph
+        node_ind = 0
+        graph_modified = False
+        for node in graph.node:
+            node_ind += 1
+            if node.op_type == "MultiThreshold":
+                thl_input = node.input[0]
+                thl_threshold = node.input[1]
+                thl_output = node.output[0]
+                thl_in_shape = model.get_tensor_shape(thl_input)
+                thl_thres_shape = model.get_tensor_shape(thl_threshold)
+                idt = model.get_tensor_datatype(thl_input)
+                # skip conversion for layers with float input
+                if not idt.is_integer():
+                    continue
+
+                # check layout of inputs/outputs, and convert if needed
+                # check layout and convert if necessary
+                thl_in_layout = model.get_tensor_layout(thl_input)
+                if thl_in_layout == DataLayout.NCHW:
+                    thl_input = nchw_to_nhwc(thl_input, model, node_ind)
+                    node_ind += 1
+                    thl_in_shape = model.get_tensor_shape(thl_input)
+
+                # keep track of where we need to insert the HW Op
+                # it has to be ahead of the output transform
+                insert_point = node_ind
+                thl_output_layout = model.get_tensor_layout(thl_output)
+                if thl_output_layout == DataLayout.NCHW:
+                    thl_output = nchw_to_nhwc(thl_output, model, node_ind, reverse=True)
+                    node_ind += 1
+
+                # now safe to assume number of channels is in last dimension
+                ifc = int(thl_in_shape[-1])
+                # create node with no parallelization first
+                pe = 1
+
+                odt = model.get_tensor_datatype(thl_output)
+                scale = getCustomOp(node).get_nodeattr("out_scale")
+                assert scale == 1.0, (
+                    node.name + ": MultiThreshold out_scale must be 1 for HW conversion."
+                )
+                actval = getCustomOp(node).get_nodeattr("out_bias")
+                assert int(actval) == actval, (
+                    node.name + ": MultiThreshold out_bias must be integer for HW conversion."
+                )
+                actval = int(actval)
+
+                # ignore BIPOLAR
+                if odt == DataType["BIPOLAR"]:
+                    continue
+                # a signed activation should always have a negative bias,
+                assert (not odt.signed()) or (actval < 0), (
+                    node.name + ": Signed output requires actval < 0"
+                )
+
+                # check if thresholds are linear with POT factor
+                threshs = model.get_initializer(thl_threshold)
+                shifts = []
+                biases = []
+                is_pot_lin = True
+                for c in range(thl_thres_shape[0]):
+                    x = threshs[c].astype(int)
+                    y = np.arange(1, x.shape[0] + 1) + actval
+                    coeff = np.polyfit(x, y, 1)
+                    pot = int(np.round(np.log2(coeff[0])))
+                    bias = int(np.round(coeff[1] * 2.0 ** (-pot)))
+                    x_test = np.repeat(x, 2) + np.tile([-1, 0], x.shape[0])
+                    y_true = np.repeat(y, 2) + np.tile([-1, 0], y.shape[0])
+                    y_test = np.trunc((x_test + bias) * 2.0**pot)
+
+                    if (y_test == y_true).all():
+                        shifts.append(pot)
+                        biases.append(bias)
+                    else:
+                        is_pot_lin = False
+                        break
+
+                if not is_pot_lin:
+                    continue
+
+                model.set_initializer(thl_threshold, np.asarray(shifts))
+                biases_tensor = model.make_new_valueinfo_name()
+                model.set_initializer(biases_tensor, np.asarray(biases))
+
+                new_node = helper.make_node(
+                    "POTLinearActivation",
+                    [thl_input, thl_threshold, biases_tensor],
+                    [thl_output],
+                    domain="finn.custom_op.fpgadataflow",
+                    backend="fpgadataflow",
+                    NumChannels=ifc,
+                    PE=pe,
+                    inputDataType=idt.name,
+                    shiftsDataType=DataType["INT32"].name,
+                    biasesDataType=DataType["INT32"].name,
+                    outputDataType=odt.name,
+                    numInputVectors=list(thl_in_shape[:-1]),
+                    name="POTLinearActivation_" + node.name,
                 )
 
                 graph.node.insert(insert_point, new_node)
