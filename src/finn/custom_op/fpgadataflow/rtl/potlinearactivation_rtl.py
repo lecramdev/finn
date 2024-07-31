@@ -124,7 +124,7 @@ class POTLinearActivation_rtl(POTLinearActivation, RTLBackend):
         shifts = model.get_initializer(self.onnx_node.input[1])
         biases = model.get_initializer(self.onnx_node.input[2])
         shifts_unique = np.unique(shifts)
-        shift_bits = int(np.ceil(np.log2(len(shifts_unique))))
+        shift_bits = max(int(np.ceil(np.log2(len(shifts_unique)))), 1)
         shift_dict = {s: i for i, s in enumerate(shifts_unique)}
         new_shifts = np.asarray([shift_dict[s] for s in shifts])
 

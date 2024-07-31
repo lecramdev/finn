@@ -22,15 +22,15 @@
 
 module pot_linear #(
     int unsigned IBITS            = 18,
-    int unsigned OBITS            = 4,
-    int unsigned BBITS            = 10,
-    int unsigned PE               = 6,
-    int unsigned FOLD             = 1,
-    int unsigned N_SHIFTS         = 4,
-    int          SHIFTS[N_SHIFTS] = '{-8, -5, -4, -2},
+    int unsigned OBITS            = 6,
+    int unsigned BBITS            = 18,
+    int unsigned PE               = 1,
+    int unsigned FOLD             = 64,
+    int unsigned N_SHIFTS         = 5,
+    int          SHIFTS[N_SHIFTS] = '{-7, -6, -5, -4, -2},
     logic        ISIGNED          = 1,
     logic        OSIGNED          = 0,
-    string       RAM_STYLE        = "block"
+    parameter    RAMSTYLE         = "block"
 )(
     //- Global Control ------------------
     input	logic  clk,
@@ -47,9 +47,7 @@ module pot_linear #(
     output	logic [OBITS*PE-1:0]  odat
 );
 
-integer fd;
 initial begin
-    fd = $fopen("my_log.txt", "w");
     if (N_SHIFTS == 0) begin
         $error("At least one shift value required!");
         $finish;
@@ -58,40 +56,48 @@ end
 
 localparam int unsigned SBITS   = N_SHIFTS >= 2 ? $clog2(N_SHIFTS) : 1;
 localparam int unsigned MEMBITS = SBITS + BBITS;
-// localparam int unsigned TMPBITS = BBITS > OBITS ? BBITS+1 : OBITS+1;
-localparam int unsigned TMPBITS = IBITS + 1;
+localparam int unsigned TMPBITS = BBITS > IBITS ? BBITS+1 : IBITS+1;
 localparam int          OUT_MIN = OSIGNED ? -(2**(OBITS-1)) : 0;
 localparam int          OUT_MAX = OSIGNED ? 2**(OBITS-1)-1 : 2**OBITS-1;
 
-// (* ram_style = "block" *)
+(* ram_style = RAMSTYLE *)
 logic[MEMBITS*PE-1:0] mem[0:FOLD-1];
 
 initial $readmemh("./memdata.dat", mem);
 
 logic[$clog2(FOLD)-1:0] ptr;
-logic[$clog2(FOLD)-1:0] ptr_n;
-assign ptr_n = (ptr == FOLD-1 ? 0 : ptr + 1);
+logic[MEMBITS*PE-1:0] mem_r;
+
+always_ff @(posedge clk) begin
+    logic[$clog2(FOLD)-1:0] ptr_n;
+
+    if(rst == 0)
+        ptr_n = 0;
+    else if ((!ovld || ordy) && ivld)
+        ptr_n = (ptr == FOLD-1 ? 0 : ptr + 1);
+    else
+        ptr_n = ptr;
+
+    mem_r <= mem[ptr_n];
+    ptr   <= ptr_n;
+end
 
 always_ff @(posedge clk) begin
     if(rst_n == 0) begin
-        ptr <= 0;
         ovld <= 0;
         odat <= 'x;
     end
     else begin
         if (!ovld || ordy) begin
-            // logic signed[TMPBITS-1:0] result;
             logic signed[TMPBITS-1:0] tmp;
             logic[SBITS-1:0] shift;
             logic signed[BBITS-1:0] bias;
             for(int unsigned pe = 0; pe < PE; pe++) begin
-                shift = mem[ptr][MEMBITS*pe+BBITS+:SBITS];
-                bias  = mem[ptr][MEMBITS*pe+:BBITS];
+                shift = mem_r[MEMBITS*pe+BBITS+:SBITS];
+                bias  = mem_r[MEMBITS*pe+:BBITS];
 
                 if (ISIGNED) begin
                     tmp = $signed(idat[IBITS*pe+:IBITS]) + bias;
-                    $fdisplay(fd, "pe=%d; idat=%d; bias=%d; tmp=%d; mem=%b; ptr=%d", pe, idat[IBITS*pe+:IBITS], bias, tmp, mem[ptr], ptr);
-                    $fflush(fd);
                 end else begin
                     tmp = $unsigned(idat[IBITS*pe+:IBITS]) + bias;
                 end
@@ -129,9 +135,6 @@ always_ff @(posedge clk) begin
                 end
             end
             ovld <= ivld;
-
-            if (ivld)
-                ptr <= ptr_n;
         end
     end
 end
