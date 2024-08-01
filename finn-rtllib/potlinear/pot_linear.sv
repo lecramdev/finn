@@ -30,7 +30,7 @@ module pot_linear #(
     int          SHIFTS[N_SHIFTS] = '{-7, -6, -5, -4, -2},
     logic        ISIGNED          = 1,
     logic        OSIGNED          = 0,
-    parameter    RAMSTYLE         = "block"
+    parameter    RAM_STYLE        = "block"
 )(
     //- Global Control ------------------
     input	logic  clk,
@@ -60,7 +60,7 @@ localparam int unsigned TMPBITS = BBITS > IBITS ? BBITS+1 : IBITS+1;
 localparam int          OUT_MIN = OSIGNED ? -(2**(OBITS-1)) : 0;
 localparam int          OUT_MAX = OSIGNED ? 2**(OBITS-1)-1 : 2**OBITS-1;
 
-(* ram_style = RAMSTYLE *)
+(* ram_style = RAM_STYLE *)
 logic[MEMBITS*PE-1:0] mem[0:FOLD-1];
 
 initial $readmemh("./memdata.dat", mem);
